@@ -2,12 +2,14 @@ import os
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
 import datetime
+import json
 import pickle
 
 import numpy as np
 import tensorflow as tf
 import matplotlib.pyplot as plt
 import seaborn as sns
+from PIL import Image
 from sklearn.utils.class_weight import compute_class_weight
 from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
 
@@ -16,9 +18,13 @@ IMG_SIZE   = (224, 224)
 BATCH_SIZE = 32
 SEED       = 42
 
-# True  = pop up every figure (the script PAUSES until you close each window)
-# False = just save the figures to the run folder and keep going
+
+tf.keras.utils.set_random_seed(SEED)
+
 SHOW_PLOTS = False
+CHECK_LEAKAGE = True
+LEAKAGE_MAX_HAMMING = 5
+MEM_CACHE_LIMIT_BYTES = 4 * 1024**3
 
 # PATHS
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -33,9 +39,6 @@ os.makedirs(model_dir, exist_ok=True)
 model_path      = os.path.join(model_dir, "medicleaf_detector_mobilenetv2.keras")
 best_model_path = os.path.join(model_dir, "best_model.keras")
 
-# TIMESTAMPED RUN FOLDER
-# Each run gets its own folder (e.g. history/20260907_143022/) so that
-# previous runs are NEVER overwritten. Compare multiple runs side by side later.
 run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 history_dir = os.path.join(script_dir, "history", run_id)
 os.makedirs(history_dir, exist_ok=True)
@@ -48,15 +51,98 @@ def save_fig(filename):
         plt.show()
     plt.close()
 
-# LOAD DATASETS
-raw_train = tf.keras.utils.image_dataset_from_directory(
-    train_dir,
-    label_mode="categorical",
-    image_size=IMG_SIZE,
-    batch_size=BATCH_SIZE,
-    shuffle=False
-)
+# DATA LEAKAGE CHECK
+IMG_EXTS     = (".jpg", ".jpeg", ".png", ".bmp", ".gif")
+_RESAMPLE    = getattr(Image, "Resampling", Image).LANCZOS  # Pillow >=9.1 fallback
 
+def dhash(path):
+    """64-bit difference hash: robust to small compression/rescale changes."""
+    img = Image.open(path).convert("L").resize((9, 8), _RESAMPLE)
+    arr = np.asarray(img, dtype=np.int16)
+    return (arr[:, 1:] > arr[:, :-1]).flatten().astype(np.uint8)
+
+def collect_split_hashes(split_dir, split_name):
+    files = [
+        os.path.join(root, fn)
+        for root, _, fns in os.walk(split_dir)
+        for fn in fns
+        if fn.lower().endswith(IMG_EXTS)
+    ]
+    paths, hashes = [], []
+    for k, p in enumerate(files, 1):
+        try:
+            hashes.append(dhash(p))
+            paths.append(p)
+        except Exception as e:
+            print(f"  [warn] could not read {p}: {e}")
+        if k % 500 == 0:
+            print(f"  {split_name}: hashed {k}/{len(files)} images ...")
+    arr = np.array(hashes) if hashes else np.zeros((0, 64), dtype=np.uint8)
+    return paths, arr
+
+def cross_split_duplicates(paths_a, hashes_a, paths_b, hashes_b, max_hamming):
+    """Near-duplicate pairs between two splits.
+
+    64 bits are split into 8 bands of 8 bits. If two hashes differ by <= 7
+    bits, at least one band must be bit-identical (pigeonhole), so grouping
+    by band turns the O(n*m) comparison into a fast candidate lookup.
+    """
+    band_index = {}
+    for j in range(len(hashes_b)):
+        hb = hashes_b[j].tobytes()
+        for b in range(8):
+            band_index.setdefault((b, hb[b * 8:(b + 1) * 8]), []).append(j)
+    pairs = []
+    for i in range(len(hashes_a)):
+        ha = hashes_a[i].tobytes()
+        cands = set()
+        for b in range(8):
+            cands.update(band_index.get((b, ha[b * 8:(b + 1) * 8]), ()))
+        for j in cands:
+            dist = int(np.count_nonzero(hashes_a[i] != hashes_b[j]))
+            if dist <= max_hamming:
+                pairs.append((paths_a[i], paths_b[j], dist))
+    return pairs
+
+if CHECK_LEAKAGE:
+    print("\n===== DATA LEAKAGE CHECK (train/valid/test near-duplicates) =====")
+    splits = {}
+    for name, d in (("train", train_dir), ("valid", val_dir), ("test", test_dir)):
+        p, h = collect_split_hashes(d, name)
+        splits[name] = (p, h)
+        print(f"  {name}: {len(p)} images hashed")
+
+    all_pairs = []
+    for a, b in (("train", "valid"), ("train", "test"), ("valid", "test")):
+        for pa, pb, dist in cross_split_duplicates(
+            *splits[a], *splits[b], LEAKAGE_MAX_HAMMING
+        ):
+            all_pairs.append((a, b, pa, pb, dist))
+
+    leakage_report = os.path.join(history_dir, "data_leakage_report.txt")
+    with open(leakage_report, "w", encoding="utf-8") as f:
+        f.write(f"Cross-split near-duplicates (dHash hamming <= {LEAKAGE_MAX_HAMMING})\n")
+        f.write("=" * 60 + "\n")
+        if all_pairs:
+            for a, b, pa, pb, dist in all_pairs:
+                f.write(f"{a} <-> {b}  dist={dist}\n  {pa}\n  {pb}\n")
+        else:
+            f.write("None found.\n")
+
+    if all_pairs:
+        print(f"  WARNING: {len(all_pairs)} near-duplicate pair(s) across splits!")
+        print("  Near-duplicates between train and val/test INFLATE your metrics")
+        print("  (the model has basically already seen the 'unseen' images).")
+        print("  First few offenders:")
+        for a, b, pa, pb, dist in all_pairs[:5]:
+            print(f"    {a}<->{b} dist={dist}:\n      {pa}\n      {pb}")
+        print("  -> Deduplicate and re-run data_splitter/split.py before")
+        print("     trusting any metric from this run.")
+    else:
+        print("  OK: no cross-split near-duplicates found.")
+    print(f"  Report saved to: {leakage_report}")
+
+# LOAD DATASETS
 train_ds = tf.keras.utils.image_dataset_from_directory(
     train_dir,
     label_mode="categorical",
@@ -89,9 +175,11 @@ print("Classes:", class_names)
 print("Number of classes:", NUM_CLASSES)
 
 # CLASS WEIGHTS
-y_train = np.concatenate(
-    [np.argmax(labels.numpy(), axis=1) for _, labels in raw_train]
-)
+name_to_idx = {name: i for i, name in enumerate(class_names)}
+y_train = np.array([
+    name_to_idx[os.path.basename(os.path.dirname(p))]
+    for p in train_ds.file_paths
+])
 
 class_weights_array = compute_class_weight(
     class_weight="balanced",
@@ -99,51 +187,45 @@ class_weights_array = compute_class_weight(
     y=y_train
 )
 print("Class weights:", {i: float(w) for i, w in enumerate(class_weights_array)})
-
-# Focal-loss alpha: inverse-frequency weights, so RARE classes count MORE.
-# (The old formula 1 / (weight * NUM_CLASSES) simply gave class frequency,
-# which up-weighted the most common classes instead.)
-# Scaled to a mean of 1 so the overall loss magnitude stays comparable.
 alpha_vals = (class_weights_array / class_weights_array.mean()).tolist()
-
-# AUGMENTATION + PREPROCESSING (built into the model)
-# Keras random layers sample a NEW random value for EVERY image
-# (unlike tf.image.random_brightness/contrast, which used one value per batch).
-# They are only active during training and are skipped at inference.
-# Input images stay on the 0-255 scale until the Rescaling layer.
 augmentation = tf.keras.Sequential([
-    # Geometric: leaves have no canonical orientation or framing
-    tf.keras.layers.RandomFlip("horizontal_and_vertical", seed=SEED),
-    tf.keras.layers.RandomRotation(0.25, fill_mode="reflect", seed=SEED),        # +/-90 degrees
+    tf.keras.layers.RandomFlip("horizontal", seed=SEED),
+    tf.keras.layers.RandomRotation(0.08, fill_mode="reflect", seed=SEED),
     tf.keras.layers.RandomZoom(0.15, fill_mode="reflect", seed=SEED),            # +/-15 %
     tf.keras.layers.RandomTranslation(0.1, 0.1, fill_mode="reflect", seed=SEED), # +/-10 %
-    # Photometric: kept mild because color is a real signal for species/disease.
-    # Saturation jitter is intentionally NOT used.
     tf.keras.layers.RandomBrightness(0.2, value_range=(0, 255), seed=SEED),      # +/-20 %
     tf.keras.layers.RandomContrast(0.2, seed=SEED),                              # +/-20 %
 ], name="augmentation")
 
-# Equivalent to mobilenet_v2.preprocess_input: scales 0-255 to [-1, 1].
-# Being part of the model, the saved .keras file accepts raw 0-255 images.
 preprocess = tf.keras.layers.Rescaling(1 / 127.5, offset=-1, name="preprocess")
 
-# No .map() step needed anymore: just cache, shuffle and prefetch.
+def maybe_cache(ds, name):
+    n_images = len(ds.file_paths)
+    est_bytes = n_images * IMG_SIZE[0] * IMG_SIZE[1] * 3 * 4
+    est_gb = est_bytes / 1024**3
+    if est_bytes <= MEM_CACHE_LIMIT_BYTES:
+        print(f"Cache [{name}]: {n_images} images (~{est_gb:.2f} GB decoded) -> RAM")
+        return ds.cache()
+    cache_dir = os.path.join(script_dir, "dataset_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_file = os.path.join(cache_dir, f"{name}_{IMG_SIZE[0]}.tfrecord")
+    print(f"Cache [{name}]: {n_images} images (~{est_gb:.2f} GB decoded) too big "
+          f"for RAM -> disk cache {cache_file}")
+    return ds.cache(cache_file)
+
 train_ds = (
-    train_ds
-    .cache()
+    maybe_cache(train_ds, "train")
     .shuffle(1000, seed=SEED, reshuffle_each_iteration=True)
     .prefetch(buffer_size=tf.data.AUTOTUNE)
 )
 
 val_ds = (
-    val_ds
-    .cache()
+    maybe_cache(val_ds, "valid")
     .prefetch(buffer_size=tf.data.AUTOTUNE)
 )
 
 test_ds = (
-    test_ds
-    .cache()
+    maybe_cache(test_ds, "test")
     .prefetch(buffer_size=tf.data.AUTOTUNE)
 )
 
@@ -153,11 +235,11 @@ focal_loss = tf.keras.losses.CategoricalFocalCrossentropy(
     alpha=alpha_vals
 )
 
+# METRICS
 METRICS = [
     "accuracy",
-    tf.keras.metrics.Precision(name="precision"),
-    tf.keras.metrics.Recall(name="recall"),
-    tf.keras.metrics.AUC(name="auc")
+    tf.keras.metrics.AUC(name="auc", multi_label=True,
+                         num_labels=NUM_CLASSES),
 ]
 
 # BASE MODEL
@@ -205,6 +287,7 @@ earlystop_cb = tf.keras.callbacks.EarlyStopping(
     restore_best_weights=True,
     verbose=1
 )
+
 reducelr_cb = tf.keras.callbacks.ReduceLROnPlateau(
     monitor="val_loss",
     factor=0.3,
@@ -214,7 +297,6 @@ reducelr_cb = tf.keras.callbacks.ReduceLROnPlateau(
 )
 
 callbacks_phase1 = [checkpoint_cb, earlystop_cb, reducelr_cb]
-callbacks_phase2 = [checkpoint_cb, earlystop_cb]
 
 # PHASE 1 — TRAIN HEAD
 print("\n===== PHASE 1: Training head (base frozen) =====")
@@ -228,6 +310,24 @@ history1 = model.fit(
 
 # PHASE 2 — FINE-TUNE
 print("\n===== PHASE 2: Fine-tuning top 40 layers =====")
+best_val_auc_phase1 = float(np.max(history1.history["val_auc"]))
+
+checkpoint_cb_p2 = tf.keras.callbacks.ModelCheckpoint(
+    best_model_path,
+    monitor="val_auc",
+    mode="max",
+    save_best_only=True,
+    initial_value_threshold=best_val_auc_phase1,
+    verbose=1
+)
+earlystop_cb_p2 = tf.keras.callbacks.EarlyStopping(
+    monitor="val_auc",
+    mode="max",
+    patience=4,
+    restore_best_weights=True,
+    verbose=1
+)
+callbacks_phase2 = [checkpoint_cb_p2, earlystop_cb_p2]
 
 base_model.trainable = True
 
@@ -258,24 +358,21 @@ history2 = model.fit(
 )
 
 # SAVE + PLOT TRAINING HISTORY
-# Merge phase 1 + phase 2 histories into one continuous record
 combined_history = {}
 for key in history1.history.keys():
     if key in history2.history:
         combined_history[key] = history1.history[key] + history2.history[key]
 
-# Save raw history as pickle (so you never lose it again)
 with open(os.path.join(history_dir, "training_history.pkl"), "wb") as f:
     pickle.dump(combined_history, f)
 
-# Number of epochs actually run in phase 1 (for the phase-boundary marker)
 phase1_epochs_ran = len(history1.history["loss"])
 
-# The checkpoint (best_model.keras) is the epoch with the highest val_auc across
-# BOTH phases, so that is the epoch every reported number should come from.
 best_idx   = int(np.argmax(combined_history["val_auc"]))
 best_epoch = best_idx + 1
-print(f"\nBest epoch (highest val_auc): {best_epoch}")
+best_phase = 1 if best_idx < phase1_epochs_ran else 2
+print(f"\nBest epoch (highest val_auc): global epoch {best_epoch} "
+      f"(phase {best_phase}; note phase-2 console logs restart at 1)")
 
 acc      = combined_history["accuracy"]
 val_acc  = combined_history["val_accuracy"]
@@ -310,14 +407,11 @@ save_fig("training_curves.png")
 print(f"Training curves saved to: {history_dir}")
 
 # LOAD BEST MODEL
-# (compiled, so that evaluate() reports loss + the METRICS)
 print("\nLoading best checkpoint ...")
 model = tf.keras.models.load_model(best_model_path)
 
 # TEST SET EVALUATION
 print("\n===== Test set evaluation =====")
-# return_dict=True: with Keras 3, model.metrics_names is ['loss', 'compile_metrics'],
-# so zip(metrics_names, results) mislabels the values and drops most of them.
 results = model.evaluate(test_ds, verbose=1, return_dict=True)
 for name, value in results.items():
     print(f"  {name}: {value:.4f}")
@@ -328,8 +422,6 @@ y_true_onehot = np.concatenate([labels.numpy() for _, labels in test_ds])
 y_true        = np.argmax(y_true_onehot, axis=1)
 
 # CONFUSION MATRIX (RAW + NORMALIZED HEATMAPS)
-# labels=ALL_LABELS keeps the matrix NUM_CLASSES x NUM_CLASSES even if a class
-# never appears in y_true / y_pred, so it always lines up with class_names.
 print("\n===== CONFUSION MATRIX =====")
 cm = confusion_matrix(y_true, y_pred, labels=ALL_LABELS)
 print(cm)
@@ -340,12 +432,6 @@ cm_normalized = np.divide(
     out=np.zeros(cm.shape, dtype=float), where=row_sums != 0
 )
 
-# Split the full matrix into several readable images, CLASSES_PER_IMAGE classes each
-# (40 classes / 10 = 4 images). For each group:
-#   rows    = the actual classes in the group
-#   columns = the same classes (predicted) + one extra "Other" column that adds up
-#             the predictions that went to classes OUTSIDE the group,
-#             so no error is hidden and every row still sums to its full total.
 CLASSES_PER_IMAGE = 10
 
 def plot_confusion_chunks(matrix, title, prefix, normalized=False):
@@ -385,7 +471,7 @@ plot_confusion_chunks(cm_normalized, "Normalized Confusion Matrix",
                       "confusion_matrix_normalized", normalized=True)
 print(f"Confusion matrix (normalized, {CLASSES_PER_IMAGE} classes per image) saved to: {history_dir}")
 
-# --- Top confused class pairs (for discussion section) ---
+#Top confused class pairs 
 print("\n===== TOP 10 MOST CONFUSED CLASS PAIRS =====")
 confused_pairs = []
 for i in range(NUM_CLASSES):
@@ -406,12 +492,7 @@ with open(pairs_path, "w", encoding="utf-8") as f:
         f.write(f"{actual} -> {predicted} : {count}\n")
 print(f"\nTop confused pairs saved to: {pairs_path}")
 
-# --- Smaller, readable heatmap: only the most-confused classes, WITH numbers ---
-# The full heatmap is too cramped to read in print, so this keeps just the
-# classes that appear most in the top confused pairs and prints the count in
-# each cell. It is a sub-matrix: errors that go to classes outside this
-# selection are not shown (worth a line in the figure caption).
-TOP_N_CONFUSED_CLASSES = 10  # change this to show more/fewer classes
+TOP_N_CONFUSED_CLASSES = 10  
 
 involved_classes = []
 for actual, predicted, count in confused_pairs:
@@ -469,12 +550,61 @@ except ValueError as e:
     macro_auc = None
     print(f"  Could not compute per-class AUC: {e}")
 
-# FINAL SUMMARY TABLE (printed + saved)
-# Train/Val rows come from the BEST epoch (the one saved as best_model.keras),
-# not the last epoch, so they describe the same model as the Test rows.
-# Note: the training metrics are running averages logged WHILE training
-# (augmentation + dropout on), so they are not directly comparable to the
-# test numbers, which are measured on the finished model.
+print("\n===== Probability calibration (temperature scaling) =====")
+
+calibration_done = False
+macro_auc_cal = None
+best_T = 1.0
+
+try:
+    val_pred_probs = model.predict(val_ds, verbose=1)
+    val_true_onehot = np.concatenate([labels.numpy() for _, labels in val_ds])
+
+    def temperature_scale(probs, T):
+        p = np.power(probs, 1.0 / T)
+        return p / p.sum(axis=1, keepdims=True)
+
+    def nll(onehot, probs):
+        p = np.clip(probs, 1e-12, 1.0)
+        return float(-np.mean(np.sum(onehot * np.log(p), axis=1)))
+
+    val_nll_before = nll(val_true_onehot, val_pred_probs)
+    best_T, best_val_nll = 1.0, val_nll_before
+    for T in np.arange(0.5, 3.01, 0.05):
+        n = nll(val_true_onehot, temperature_scale(val_pred_probs, T))
+        if n < best_val_nll:
+            best_val_nll, best_T = n, float(T)
+
+    test_probs_cal  = temperature_scale(y_pred_probs, best_T)
+    test_nll_before = nll(y_true_onehot, y_pred_probs)
+    test_nll_after  = nll(y_true_onehot, test_probs_cal)
+    try:
+        macro_auc_cal = roc_auc_score(y_true_onehot, test_probs_cal, average="macro")
+    except ValueError:
+        pass
+
+    print(f"  Best temperature (val NLL): T = {best_T:.2f}")
+    print(f"  Val  NLL:  {val_nll_before:.4f} -> {nll(val_true_onehot, temperature_scale(val_pred_probs, best_T)):.4f}")
+    print(f"  Test NLL:  {test_nll_before:.4f} -> {test_nll_after:.4f}")
+    print("  Predicted classes (argmax) are unchanged; only confidences move.")
+    if macro_auc_cal is not None:
+        print(f"  Test macro AUC: {macro_auc:.4f} -> {macro_auc_cal:.4f}")
+
+    calibration = {
+        "temperature": float(best_T),
+        "formula": "calibrated_prob = p**(1/T); calibrated_prob /= sum_over_classes",
+        "note": "argmax (predicted class) is unchanged; only confidence values are calibrated",
+        "val_nll_before": val_nll_before,
+        "val_nll_after": float(best_val_nll),
+    }
+    with open(os.path.join(model_dir, "calibration.json"), "w", encoding="utf-8") as f:
+        json.dump(calibration, f, indent=2)
+    print(f"  Calibration saved to: {os.path.join(model_dir, 'calibration.json')}")
+    calibration_done = True
+except Exception as e:
+    print(f"  Calibration skipped: {type(e).__name__}: {e}")
+
+# FINAL SUMMARY TABLE 
 report_dict = classification_report(
     y_true, y_pred,
     labels=ALL_LABELS, target_names=class_names,
@@ -494,21 +624,18 @@ summary_lines = [
     "=" * 50,
     "FINAL SUMMARY TABLE",
     "=" * 50,
-    f"Best checkpoint: epoch {best_epoch} of {len(acc)} (highest val_auc)",
+    f"Best checkpoint: global epoch {best_epoch} of {len(acc)} "
+    f"(phase {best_phase}, highest macro val_auc)",
     "-" * 35,
     f"{'Metric':<25}{'Value':<10}",
     "-" * 35,
     row("Train Accuracy",  ch["accuracy"][b]),
     row("Train Loss",      ch["loss"][b]),
-    row("Train Precision", ch["precision"][b]),
-    row("Train Recall",    ch["recall"][b]),
-    row("Train AUC",       ch["auc"][b]),
+    row("Train Macro AUC", ch["auc"][b]),
     "-" * 35,
     row("Val Accuracy",    ch["val_accuracy"][b]),
     row("Val Loss",        ch["val_loss"][b]),
-    row("Val Precision",   ch["val_precision"][b]),
-    row("Val Recall",      ch["val_recall"][b]),
-    row("Val AUC",         ch["val_auc"][b]),
+    row("Val Macro AUC",   ch["val_auc"][b]),
     "-" * 35,
     row("Test Accuracy",           overall_accuracy),
     row("Test Macro Precision",    macro_avg["precision"]),
@@ -520,6 +647,10 @@ summary_lines = [
 ]
 if macro_auc is not None:
     summary_lines.append(row("Test Macro AUC", macro_auc))
+if calibration_done:
+    summary_lines.append(row("Temperature (T)", best_T))
+    if macro_auc_cal is not None:
+        summary_lines.append(row("Test Macro AUC (cal)", macro_auc_cal))
 summary_lines.append("=" * 50)
 
 print("\n" + "\n".join(summary_lines))
@@ -529,6 +660,11 @@ with open(summary_path, "w", encoding="utf-8") as f:
     f.write("\n".join(summary_lines) + "\n")
 print(f"\nFinal summary table also saved to: {summary_path}")
 
-# SAVE FINAL MODEL (copy of the best checkpoint)
+# SAVE FINAL MODEL 
 model.save(model_path)
 print(f"\nModel saved to: {model_path}")
+
+class_names_path = os.path.join(model_dir, "class_names.json")
+with open(class_names_path, "w", encoding="utf-8") as f:
+    json.dump(class_names, f, ensure_ascii=False, indent=2)
+print(f"Class names saved to: {class_names_path}")
